@@ -194,15 +194,11 @@ func main() {
 		}
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgrOpts := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
 		},
-		WebhookServer: webhook.NewServer(webhook.Options{
-			Port:    webhookPort,
-			CertDir: webhookCertDir,
-		}),
 		HealthProbeBindAddress:     probeAddr,
 		LeaderElection:             enableLeaderElection,
 		LeaderElectionID:           "controller-leader-elect-capoci",
@@ -214,7 +210,17 @@ func main() {
 		Cache: cache.Options{
 			DefaultNamespaces: watchNamespaces,
 		},
-	})
+	}
+
+	// Only create webhook server when webhookPort != 0 (webhook mode)
+	if webhookPort != 0 {
+		mgrOpts.WebhookServer = webhook.NewServer(webhook.Options{
+			Port:    webhookPort,
+			CertDir: webhookCertDir,
+		})
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -222,171 +228,175 @@ func main() {
 	// Setup the context that's going to be used in controllers and for the manager.
 	ctx := ctrl.SetupSignalHandler()
 
-	var clientProvider *scope.ClientProvider
-	var region string
-	if initOciClientsOnStartup {
-		authConfigDir := os.Getenv(AuthConfigDirectory)
-		if authConfigDir == "" {
-			setupLog.Error(err, "auth config directory environment variable is not set")
-			os.Exit(1)
+	// Controller-only mode: webhookPort == 0
+	if webhookPort == 0 {
+		var clientProvider *scope.ClientProvider
+		var region string
+		if initOciClientsOnStartup {
+			authConfigDir := os.Getenv(AuthConfigDirectory)
+			if authConfigDir == "" {
+				setupLog.Error(err, "auth config directory environment variable is not set")
+				os.Exit(1)
+			}
+
+			authConfig, err := config.FromDir(authConfigDir)
+			if err != nil {
+				setupLog.Error(err, "invalid auth config file")
+				os.Exit(1)
+			}
+
+			setupLog.Info("CAPOCI Version", "version", version.GitVersion)
+			ociAuthConfigProvider, err := config.NewConfigurationProvider(authConfig)
+			if err != nil {
+				setupLog.Error(err, "authentication provider could not be initialised")
+				os.Exit(1)
+			}
+
+			region, err = ociAuthConfigProvider.Region()
+			if err != nil {
+				setupLog.Error(err, "unable to get OCI region from AuthConfigProvider")
+				os.Exit(1)
+			}
+
+			clientProvider, err = scope.NewClientProvider(scope.ClientProviderParams{
+				OciAuthConfigProvider: ociAuthConfigProvider})
+			if err != nil {
+				setupLog.Error(err, "unable to create OCI ClientProvider")
+				os.Exit(1)
+			}
+			_, err = clientProvider.GetOrBuildClient(region)
+			if err != nil {
+				setupLog.Error(err, "authentication provider could not be initialised")
+				os.Exit(1)
+			}
 		}
-
-		authConfig, err := config.FromDir(authConfigDir)
-		if err != nil {
-			setupLog.Error(err, "invalid auth config file")
-			os.Exit(1)
+		if enableInstanceMetadataServiceLookup {
+			common.EnableInstanceMetadataServiceLookup()
 		}
-
-		setupLog.Info("CAPOCI Version", "version", version.GitVersion)
-		ociAuthConfigProvider, err := config.NewConfigurationProvider(authConfig)
-		if err != nil {
-			setupLog.Error(err, "authentication provider could not be initialised")
-			os.Exit(1)
-		}
-
-		region, err = ociAuthConfigProvider.Region()
-		if err != nil {
-			setupLog.Error(err, "unable to get OCI region from AuthConfigProvider")
-			os.Exit(1)
-		}
-
-		clientProvider, err = scope.NewClientProvider(scope.ClientProviderParams{
-			OciAuthConfigProvider: ociAuthConfigProvider})
-		if err != nil {
-			setupLog.Error(err, "unable to create OCI ClientProvider")
-			os.Exit(1)
-		}
-		_, err = clientProvider.GetOrBuildClient(region)
-		if err != nil {
-			setupLog.Error(err, "authentication provider could not be initialised")
-			os.Exit(1)
-		}
-	}
-	if enableInstanceMetadataServiceLookup {
-		common.EnableInstanceMetadataServiceLookup()
-	}
-	if err = (&controllers.OCIClusterReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		Region:         region,
-		ClientProvider: clientProvider,
-		Recorder:       mgr.GetEventRecorderFor("ocicluster-controller"),
-	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", scope.OCIClusterKind)
-		os.Exit(1)
-	}
-
-	if err = (&controllers.OCIMachineReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		ClientProvider: clientProvider,
-		Region:         region,
-		Recorder:       mgr.GetEventRecorderFor("ocimachine-controller"),
-	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociMachineConcurrency}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", scope.OCIMachineKind)
-		os.Exit(1)
-	}
-
-	if err = (&controllers.OCIManagedClusterReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		Region:         region,
-		ClientProvider: clientProvider,
-		Recorder:       mgr.GetEventRecorderFor("ocimanagedcluster-controller"),
-	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", scope.OCIManagedClusterKind)
-		os.Exit(1)
-	}
-
-	if err = (&controllers.OCIManagedClusterControlPlaneReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		Region:         region,
-		ClientProvider: clientProvider,
-		Recorder:       mgr.GetEventRecorderFor("ocimanagedclustercontrolplane-controller"),
-	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", scope.OCIManagedClusterControlPlaneKind)
-		os.Exit(1)
-	}
-
-	if feature.Gates.Enabled(feature.MachinePool) {
-		setupLog.Info("MACHINE POOL experimental feature enabled")
-		setupLog.V(1).Info("enabling machine pool controller")
-		if err := (&expcontrollers.OCIMachinePoolReconciler{
-			Client:         mgr.GetClient(),
-			Scheme:         mgr.GetScheme(),
-			ClientProvider: clientProvider,
-			Recorder:       mgr.GetEventRecorderFor("ocimachinepool-controller"),
-			Region:         region,
-		}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociMachinePoolConcurrency}); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", scope.OCIMachinePoolKind)
-			os.Exit(1)
-		}
-
-		setupLog.Info("OKE experimental feature enabled")
-		setupLog.V(1).Info("enabling managed machine pool controller")
-		if err = (&expcontrollers.OCIManagedMachinePoolReconciler{
+		if err = (&controllers.OCIClusterReconciler{
 			Client:         mgr.GetClient(),
 			Scheme:         mgr.GetScheme(),
 			Region:         region,
 			ClientProvider: clientProvider,
-			Recorder:       mgr.GetEventRecorderFor("ocimanagedmachinepool-controller"),
-		}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociMachinePoolConcurrency}); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", scope.OCIManagedMachinePoolKind)
-			os.Exit(1)
-		}
-
-		if err = (&expcontrollers.OCIVirtualMachinePoolReconciler{
-			Client:         mgr.GetClient(),
-			Scheme:         mgr.GetScheme(),
-			Region:         region,
-			ClientProvider: clientProvider,
-			Recorder:       mgr.GetEventRecorderFor("ocivirtualmachinepool-controller"),
+			Recorder:       mgr.GetEventRecorderFor("ocicluster-controller"),
 		}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", scope.OCIVirtualMachinePoolKind)
+			setupLog.Error(err, "unable to create controller", "controller", scope.OCIClusterKind)
 			os.Exit(1)
 		}
 
-		if err = (&expcontrollers.OCIMachinePoolMachineReconciler{
+		if err = (&controllers.OCIMachineReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			ClientProvider: clientProvider,
+			Region:         region,
+			Recorder:       mgr.GetEventRecorderFor("ocimachine-controller"),
+		}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociMachineConcurrency}); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", scope.OCIMachineKind)
+			os.Exit(1)
+		}
+
+		if err = (&controllers.OCIManagedClusterReconciler{
 			Client:         mgr.GetClient(),
 			Scheme:         mgr.GetScheme(),
 			Region:         region,
 			ClientProvider: clientProvider,
-			Recorder:       mgr.GetEventRecorderFor("ocimachinepoolmachine-controller"),
+			Recorder:       mgr.GetEventRecorderFor("ocimanagedcluster-controller"),
 		}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "OCIMachinePoolMachine")
+			setupLog.Error(err, "unable to create controller", "controller", scope.OCIManagedClusterKind)
 			os.Exit(1)
 		}
-	}
 
-	if err = (&infrastructurev1beta2.OCICluster{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "OCICluster")
-		os.Exit(1)
-	}
+		if err = (&controllers.OCIManagedClusterControlPlaneReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			Region:         region,
+			ClientProvider: clientProvider,
+			Recorder:       mgr.GetEventRecorderFor("ocimanagedclustercontrolplane-controller"),
+		}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", scope.OCIManagedClusterControlPlaneKind)
+			os.Exit(1)
+		}
 
-	if err = (&infrastructurev1beta2.OCIMachineTemplate{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "OCIMachineTemplate")
-		os.Exit(1)
-	}
+		if feature.Gates.Enabled(feature.MachinePool) {
+			setupLog.Info("MACHINE POOL experimental feature enabled")
+			setupLog.V(1).Info("enabling machine pool controller")
+			if err := (&expcontrollers.OCIMachinePoolReconciler{
+				Client:         mgr.GetClient(),
+				Scheme:         mgr.GetScheme(),
+				ClientProvider: clientProvider,
+				Recorder:       mgr.GetEventRecorderFor("ocimachinepool-controller"),
+				Region:         region,
+			}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociMachinePoolConcurrency}); err != nil {
+				setupLog.Error(err, "unable to create controller", "controller", scope.OCIMachinePoolKind)
+				os.Exit(1)
+			}
 
-	if err = (&infrastructurev1beta2.OCIManagedCluster{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "OCIManagedCluster")
-		os.Exit(1)
-	}
+			setupLog.Info("OKE experimental feature enabled")
+			setupLog.V(1).Info("enabling managed machine pool controller")
+			if err = (&expcontrollers.OCIManagedMachinePoolReconciler{
+				Client:         mgr.GetClient(),
+				Scheme:         mgr.GetScheme(),
+				Region:         region,
+				ClientProvider: clientProvider,
+				Recorder:       mgr.GetEventRecorderFor("ocimanagedmachinepool-controller"),
+			}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociMachinePoolConcurrency}); err != nil {
+				setupLog.Error(err, "unable to create controller", "controller", scope.OCIManagedMachinePoolKind)
+				os.Exit(1)
+			}
 
-	if err = (&infrastructurev1beta2.OCIManagedControlPlane{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "OCIManagedControlPlane")
-		os.Exit(1)
-	}
+			if err = (&expcontrollers.OCIVirtualMachinePoolReconciler{
+				Client:         mgr.GetClient(),
+				Scheme:         mgr.GetScheme(),
+				Region:         region,
+				ClientProvider: clientProvider,
+				Recorder:       mgr.GetEventRecorderFor("ocivirtualmachinepool-controller"),
+			}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
+				setupLog.Error(err, "unable to create controller", "controller", scope.OCIVirtualMachinePoolKind)
+				os.Exit(1)
+			}
 
-	if err = (&expV1Beta2.OCIManagedMachinePool{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "OCIManagedMachinePool")
-		os.Exit(1)
-	}
+			if err = (&expcontrollers.OCIMachinePoolMachineReconciler{
+				Client:         mgr.GetClient(),
+				Scheme:         mgr.GetScheme(),
+				Region:         region,
+				ClientProvider: clientProvider,
+				Recorder:       mgr.GetEventRecorderFor("ocimachinepoolmachine-controller"),
+			}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: ociClusterConcurrency}); err != nil {
+				setupLog.Error(err, "unable to create controller", "controller", "OCIMachinePoolMachine")
+				os.Exit(1)
+			}
+		}
+	} else {
+		// Webhook-only mode: webhookPort != 0
+		if err = (&infrastructurev1beta2.OCICluster{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "OCICluster")
+			os.Exit(1)
+		}
 
-	if err = (&expV1Beta2.OCIVirtualMachinePool{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "OCIVirtualMachinePool")
-		os.Exit(1)
+		if err = (&infrastructurev1beta2.OCIMachineTemplate{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "OCIMachineTemplate")
+			os.Exit(1)
+		}
+
+		if err = (&infrastructurev1beta2.OCIManagedCluster{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "OCIManagedCluster")
+			os.Exit(1)
+		}
+
+		if err = (&infrastructurev1beta2.OCIManagedControlPlane{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "OCIManagedControlPlane")
+			os.Exit(1)
+		}
+
+		if err = (&expV1Beta2.OCIManagedMachinePool{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "OCIManagedMachinePool")
+			os.Exit(1)
+		}
+
+		if err = (&expV1Beta2.OCIVirtualMachinePool{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "OCIVirtualMachinePool")
+			os.Exit(1)
+		}
 	}
 	//+kubebuilder:scaffold:builder
 
