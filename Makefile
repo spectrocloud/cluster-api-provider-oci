@@ -18,13 +18,24 @@ SHELL:=/usr/bin/env bash
 
 # Docker related variables.
 #export GCP_PROJECT ?= $(shell gcloud config get-value project)
-REGISTRY ?= ghcr.io/oracle
+FIPS_ENABLE ?= ""
+
+BUILDER_GOLANG_VERSION ?= 1.24
+BUILD_ARGS = --build-arg CRYPTO_LIB=${FIPS_ENABLE} --build-arg BUILDER_GOLANG_VERSION=${BUILDER_GOLANG_VERSION}
+
+RELEASE_LOC := release
+ifeq ($(FIPS_ENABLE),yes)
+  RELEASE_LOC := release-fips
+endif
+SPECTRO_VERSION ?= 4.0.0-dev
+
+REGISTRY ?= gcr.io/spectro-dev-public/release
 PROD_REGISTRY ?= ghcr.io/oracle
 IMAGE_NAME ?= cluster-api-oci-controller
 CONTROLLER_IMG ?= $(REGISTRY)/$(IMAGE_NAME)
-TAG ?= dev
+TAG ?= v0.23.0-spectro-${SPECTRO_VERSION}
 ARCH ?= amd64
-ALL_ARCH = amd64 arm64 
+ALL_ARCH = amd64 arm64
 TOOLS_DIR := hack/tools
 TOOLS_BIN_DIR := $(abspath $(TOOLS_DIR)/bin)
 
@@ -194,15 +205,9 @@ lint: $(GOLANGCI_LINT)
 ## Docker
 ## --------------------------------------
 
-.PHONY: docker-pull-prerequisites
-docker-pull-prerequisites:
-    docker pull docker/dockerfile:1.1-experimental
-	docker pull docker.io/library/golang:1.19
-	docker pull gcr.io/distroless/static:latest
-
-.PHONY: lint docker-build
-docker-build: docker-pull-prerequisites ## Build the docker image for controller-manager
-	docker build --build-arg ARCH=$(ARCH) --build-arg LDFLAGS="$(LDFLAGS)" . -t $(CONTROLLER_IMG)-$(ARCH):$(TAG)
+.PHONY: docker-build
+docker-build: ## Build the docker image for controller-manager
+	docker buildx build --load --platform linux/${ARCH} ${BUILD_ARGS} --build-arg ARCH=$(ARCH) --build-arg LDFLAGS="$(LDFLAGS)" . -t $(CONTROLLER_IMG)-$(ARCH):$(TAG)
 	$(MAKE) set-manifest-image MANIFEST_IMG=$(CONTROLLER_IMG)-$(ARCH) MANIFEST_TAG=$(TAG) TARGET_RESOURCE="./config/default/manager_image_patch.yaml"
 	$(MAKE) set-manifest-pull-policy TARGET_RESOURCE="./config/default/manager_pull_policy.yaml"
 

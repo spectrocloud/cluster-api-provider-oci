@@ -113,3 +113,40 @@ Use this single prompt:
 5. **Conditional Main Logic**: OCI client initialization, feature gates, and instance metadata service only active in controller mode
 6. **Minimal File Structure**: Controller has 2 files, webhook has 5 files — image, pull policy, and credentials handled externally by Spectro platform
 7. **Namespace Removal**: Namespace resource from config/manager/manager.yaml excluded via `$patch: delete` in both kustomizations — namespace creation handled by Spectro platform
+
+---
+
+### CI/CD Image Build Changes
+
+- Rewrite Dockerfile to use Spectro build-base-images pattern:
+  - Builder base: `us-docker.pkg.dev/palette-images/build-base-images/golang:${BUILDER_GOLANG_VERSION}-alpine`
+  - FIPS support via `CRYPTO_LIB` build arg → `GOEXPERIMENT=boringcrypto`
+  - Conditional build: `go-build-fips.sh` (FIPS) or `go-build-static.sh` (standard) — scripts from base image
+  - FIPS assertions: `assert-static.sh` and `assert-fips.sh` run when CRYPTO_LIB is set
+  - Vulnerability scanning: `scan-govulncheck.sh` always runs
+  - Runtime image: `gcr.io/distroless/static:latest` (replaces Oracle Linux)
+  - Go module caching via `--mount=type=cache`
+  - Copy entire workspace (`COPY ./ ./`) instead of individual directories
+  - Multi-platform support via `--platform=$TARGETPLATFORM`
+
+- Modify Makefile Docker section:
+  - Add variables: `FIPS_ENABLE ?= ""`, `BUILDER_GOLANG_VERSION ?= 1.24`, `SPECTRO_VERSION ?= 4.0.0-dev`
+  - Add `BUILD_ARGS = --build-arg CRYPTO_LIB=${FIPS_ENABLE} --build-arg BUILDER_GOLANG_VERSION=${BUILDER_GOLANG_VERSION}`
+  - Add `RELEASE_LOC` (release or release-fips based on FIPS_ENABLE)
+  - Update `REGISTRY ?= gcr.io/spectro-dev-public/release`
+  - Update `TAG ?= v0.23.0-spectro-${SPECTRO_VERSION}`
+  - Update `docker-build` target: `docker buildx build --load --platform linux/${ARCH} ${BUILD_ARGS}` (replaces plain `docker build`)
+  - Remove `docker-pull-prerequisites` target (no longer needed)
+  - Keep existing `docker-build-all`, `docker-push-all`, `docker-push-manifest` targets unchanged
+
+- Add new `.github/workflows/spectro-release.yaml`:
+  - `workflow_dispatch` with `release_version` and `rel_type` (release/rc) inputs
+  - Dual registry: `LEGACY_REGISTRY` (us-docker.pkg.dev/palette-images/palette/cluster-api-oci) and `FIPS_REGISTRY` (us-docker.pkg.dev/palette-images-fips/palette/cluster-api-oci)
+  - RC builds use dev registries: `us-east1-docker.pkg.dev/spectro-images/dev/cluster-api-oci` and `us-east1-docker.pkg.dev/spectro-images/dev-fips/cluster-api-oci`
+  - Tag-exists check prevents duplicate releases
+  - Docker Buildx setup for multi-arch builds
+  - Dual registry login (production + dev)
+  - Standard image build: `make docker-build-all && make docker-push-all`
+  - FIPS image build: `FIPS_ENABLE=yes make docker-build-all && make docker-push-all`
+  - GitHub Release creation for non-rc builds (tag: v{version}-spectro)
+  - `BUILDER_GOLANG_VERSION: 1.24.3` (matches go.mod toolchain)
